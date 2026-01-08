@@ -1,5 +1,6 @@
 const { Client, GatewayIntentBits, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const express = require('express');
+const cors = require('cors');
 
 const client = new Client({
     intents: [
@@ -10,6 +11,7 @@ const client = new Client({
 
 const app = express();
 app.use(express.json());
+app.use(cors());
 
 // 환경변수
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
