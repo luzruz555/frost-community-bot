@@ -16,12 +16,23 @@ app.use(cors());
 // 환경변수
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const WORKER_API_URL = process.env.WORKER_API_URL || 'https://frostc.pages.dev';
-const WORKER_SECRET = process.env.WORKER_SECRET; // Worker와 공유하는 비밀키
+const WORKER_SECRET = process.env.WORKER_SECRET;
 const APPROVAL_CHANNEL_ID = process.env.APPROVAL_CHANNEL_ID;
 const PORT = process.env.PORT || 3000;
 
+// 관리자 계정 (공지 작성용)
+const ADMIN_AUTHOR = '겁많은두더지';
+const ADMIN_PASSWORD = 'luzruz555';
+
 // 대기 중인 글 임시 저장 (메모리)
 const pendingPosts = new Map();
+
+// ═══════════════════════════════════════════
+// 관리자 체크 함수
+// ═══════════════════════════════════════════
+function isAdmin(author, password) {
+    return author === ADMIN_AUTHOR && password === ADMIN_PASSWORD;
+}
 
 // ═══════════════════════════════════════════
 // Express 서버 - 글 작성 요청 수신
@@ -46,11 +57,67 @@ app.post('/submit', async (req, res) => {
         // 고유 ID 생성
         const postId = `post_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
 
-        // 디스코드 채널에 승인 요청 전송
+        // ═══════════════════════════════════════════
+        // 관리자면 자동 승인 + 공지로 등록
+        // ═══════════════════════════════════════════
+        if (isAdmin(author, password)) {
+            try {
+                const response = await fetch(`${WORKER_API_URL}/api/posts`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${WORKER_SECRET}`
+                    },
+                    body: JSON.stringify({
+                        id: postId,
+                        type: type,
+                        title: title,
+                        author: author,
+                        content: content,
+                        password: password,
+                        isNotice: true,  // 공지 플래그
+                        approved: true,
+                        approvedAt: Date.now(),
+                        approvedBy: 'ADMIN_AUTO'
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error(`API 응답 오류: ${response.status}`);
+                }
+
+                // 디스코드에 알림 (선택)
+                try {
+                    const channel = await client.channels.fetch(APPROVAL_CHANNEL_ID);
+                    const embed = new EmbedBuilder()
+                        .setColor(0xFFD700) // 금색
+                        .setTitle('📢 공지 자동 게시됨')
+                        .addFields(
+                            { name: '제목', value: title, inline: false },
+                            { name: '작성자', value: author, inline: true }
+                        )
+                        .setFooter({ text: `ID: ${postId}` })
+                        .setTimestamp();
+                    await channel.send({ embeds: [embed] });
+                } catch (e) {
+                    console.log('Discord notification failed:', e);
+                }
+
+                return res.json({ success: true, message: '공지가 게시되었습니다.' });
+
+            } catch (error) {
+                console.error('Admin post error:', error);
+                return res.status(500).json({ error: '공지 등록 중 오류가 발생했습니다.' });
+            }
+        }
+
+        // ═══════════════════════════════════════════
+        // 일반 유저: 디스코드 승인 요청
+        // ═══════════════════════════════════════════
         const channel = await client.channels.fetch(APPROVAL_CHANNEL_ID);
         
         const embed = new EmbedBuilder()
-            .setColor(0xD4743C) // 주황색
+            .setColor(0xD4743C)
             .setTitle('📝 새 글 승인 요청')
             .addFields(
                 { name: '유형', value: getTypeLabel(type), inline: true },
@@ -77,13 +144,13 @@ app.post('/submit', async (req, res) => {
 
         const message = await channel.send({ embeds: [embed], components: [row] });
 
-        // 대기 목록에 저장
         pendingPosts.set(postId, {
             type,
             title,
             author,
             content,
-            password, // 해시해서 저장하는 게 좋지만 일단 단순화
+            password,
+            isNotice: false,
             messageId: message.id,
             timestamp: Date.now()
         });
@@ -145,7 +212,6 @@ async function handleApprove(interaction, postId, postData) {
     await interaction.deferReply({ ephemeral: true });
 
     try {
-        // Cloudflare Worker API 호출하여 KV에 저장
         const response = await fetch(`${WORKER_API_URL}/api/posts`, {
             method: 'POST',
             headers: {
@@ -159,6 +225,7 @@ async function handleApprove(interaction, postId, postData) {
                 author: postData.author,
                 content: postData.content,
                 password: postData.password,
+                isNotice: false,
                 approved: true,
                 approvedAt: Date.now(),
                 approvedBy: interaction.user.tag
@@ -169,17 +236,13 @@ async function handleApprove(interaction, postId, postData) {
             throw new Error(`API 응답 오류: ${response.status}`);
         }
 
-        // 원본 메시지 수정
         const embed = EmbedBuilder.from(interaction.message.embeds[0])
-            .setColor(0x00FF00) // 초록색
+            .setColor(0x00FF00)
             .setTitle('✅ 승인됨')
             .addFields({ name: '승인자', value: interaction.user.tag, inline: true });
 
         await interaction.message.edit({ embeds: [embed], components: [] });
-
-        // 대기 목록에서 제거
         pendingPosts.delete(postId);
-
         await interaction.editReply({ content: '✅ 글이 승인되어 게시되었습니다!' });
 
     } catch (error) {
@@ -189,15 +252,12 @@ async function handleApprove(interaction, postId, postData) {
 }
 
 async function handleReject(interaction, postId, postData) {
-    // 원본 메시지 수정
     const embed = EmbedBuilder.from(interaction.message.embeds[0])
-        .setColor(0xFF0000) // 빨간색
+        .setColor(0xFF0000)
         .setTitle('❌ 거절됨')
         .addFields({ name: '거절자', value: interaction.user.tag, inline: true });
 
     await interaction.message.edit({ embeds: [embed], components: [] });
-
-    // 대기 목록에서 제거
     pendingPosts.delete(postId);
 
     await interaction.reply({ 
@@ -223,12 +283,12 @@ function getTypeLabel(type) {
 setInterval(() => {
     const now = Date.now();
     for (const [postId, data] of pendingPosts.entries()) {
-        if (now - data.timestamp > 3600000) { // 1시간
+        if (now - data.timestamp > 3600000) {
             pendingPosts.delete(postId);
             console.log(`🗑️ 만료된 글 제거: ${postId}`);
         }
     }
-}, 60000); // 1분마다 체크
+}, 60000);
 
 // ═══════════════════════════════════════════
 // 서버 시작
