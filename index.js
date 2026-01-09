@@ -374,7 +374,7 @@ function getTypeLabel(type) {
 setInterval(() => {
     const now = Date.now();
     for (const [postId, data] of pendingPosts.entries()) {
-        if (now - data.timestamp > 3600000) {
+        if (now - data.timestamp > 86400000) {
             pendingPosts.delete(postId);
             console.log(`🗑️ 만료된 글 제거: ${postId}`);
         }
