@@ -27,6 +27,9 @@ const ADMIN_PASSWORD = 'luzruz555';
 // 대기 중인 글 임시 저장 (메모리)
 const pendingPosts = new Map();
 
+// 처리 중인 글 (중복 방지)
+const processingPosts = new Set();
+
 // ═══════════════════════════════════════════
 // 관리자 체크 함수
 // ═══════════════════════════════════════════
@@ -75,7 +78,7 @@ app.post('/submit', async (req, res) => {
                         author: author,
                         content: content,
                         password: password,
-                        isNotice: true,  // 공지 플래그
+                        isNotice: true,
                         approved: true,
                         approvedAt: Date.now(),
                         approvedBy: 'ADMIN_AUTO'
@@ -86,11 +89,11 @@ app.post('/submit', async (req, res) => {
                     throw new Error(`API 응답 오류: ${response.status}`);
                 }
 
-                // 디스코드에 알림 (선택)
+                // 디스코드에 알림
                 try {
                     const channel = await client.channels.fetch(APPROVAL_CHANNEL_ID);
                     const embed = new EmbedBuilder()
-                        .setColor(0xFFD700) // 금색
+                        .setColor(0xFFD700)
                         .setTitle('📢 공지 자동 게시됨')
                         .addFields(
                             { name: '제목', value: title, inline: false },
@@ -184,10 +187,20 @@ client.once('ready', () => {
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
 
-    const [action, postId] = interaction.customId.split('_').reduce((acc, part, i, arr) => {
-        if (i === 0) return [part, arr.slice(1).join('_')];
-        return acc;
-    }, []);
+    const customId = interaction.customId;
+    const parts = customId.split('_');
+    const action = parts[0];
+    const postId = parts.slice(1).join('_');
+
+    // ═══════════════════════════════════════════
+    // 중복 클릭 방지
+    // ═══════════════════════════════════════════
+    if (processingPosts.has(postId)) {
+        return interaction.reply({ 
+            content: '⏳ 처리 중입니다. 잠시만 기다려주세요...', 
+            ephemeral: true 
+        });
+    }
 
     const postData = pendingPosts.get(postId);
 
@@ -198,20 +211,46 @@ client.on('interactionCreate', async (interaction) => {
         });
     }
 
-    if (action === 'approve') {
-        await handleApprove(interaction, postId, postData);
-    } else if (action === 'reject') {
-        await handleReject(interaction, postId, postData);
+    // 처리 중 표시
+    processingPosts.add(postId);
+
+    try {
+        if (action === 'approve') {
+            await handleApprove(interaction, postId, postData);
+        } else if (action === 'reject') {
+            await handleReject(interaction, postId, postData);
+        }
+    } finally {
+        // 처리 완료 후 제거 (5초 후 - 혹시 모를 지연 클릭 방지)
+        setTimeout(() => {
+            processingPosts.delete(postId);
+        }, 5000);
     }
 });
 
 // ═══════════════════════════════════════════
-// 승인/거절 처리 함수
+// 승인 처리 함수
 // ═══════════════════════════════════════════
 async function handleApprove(interaction, postId, postData) {
-    await interaction.deferReply({ ephemeral: true });
+    // 즉시 버튼 비활성화
+    const disabledRow = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId(`approve_${postId}`)
+                .setLabel('처리 중...')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(true),
+            new ButtonBuilder()
+                .setCustomId(`reject_${postId}`)
+                .setLabel('거절')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(true)
+        );
+
+    await interaction.update({ components: [disabledRow] });
 
     try {
+        // Cloudflare Worker API 호출
         const response = await fetch(`${WORKER_API_URL}/api/posts`, {
             method: 'POST',
             headers: {
@@ -233,34 +272,86 @@ async function handleApprove(interaction, postId, postData) {
         });
 
         if (!response.ok) {
-            throw new Error(`API 응답 오류: ${response.status}`);
+            const errorText = await response.text();
+            throw new Error(`API 응답 오류: ${response.status} - ${errorText}`);
         }
 
+        // 성공: 메시지 수정
         const embed = EmbedBuilder.from(interaction.message.embeds[0])
             .setColor(0x00FF00)
             .setTitle('✅ 승인됨')
             .addFields({ name: '승인자', value: interaction.user.tag, inline: true });
 
         await interaction.message.edit({ embeds: [embed], components: [] });
+        
+        // 대기 목록에서 제거
         pendingPosts.delete(postId);
-        await interaction.editReply({ content: '✅ 글이 승인되어 게시되었습니다!' });
+
+        await interaction.followUp({ 
+            content: '✅ 글이 승인되어 게시되었습니다!', 
+            ephemeral: true 
+        });
 
     } catch (error) {
         console.error('Approve error:', error);
-        await interaction.editReply({ content: '❌ 승인 처리 중 오류가 발생했습니다.' });
+        
+        // 실패: 버튼 다시 활성화
+        const retryRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`approve_${postId}`)
+                    .setLabel('승인')
+                    .setStyle(ButtonStyle.Success)
+                    .setEmoji('✅'),
+                new ButtonBuilder()
+                    .setCustomId(`reject_${postId}`)
+                    .setLabel('거절')
+                    .setStyle(ButtonStyle.Danger)
+                    .setEmoji('❌')
+            );
+
+        await interaction.message.edit({ components: [retryRow] });
+        
+        await interaction.followUp({ 
+            content: `❌ 승인 처리 중 오류가 발생했습니다.\n오류: ${error.message}`, 
+            ephemeral: true 
+        });
     }
 }
 
+// ═══════════════════════════════════════════
+// 거절 처리 함수
+// ═══════════════════════════════════════════
 async function handleReject(interaction, postId, postData) {
+    // 즉시 버튼 비활성화
+    const disabledRow = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId(`approve_${postId}`)
+                .setLabel('승인')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(true),
+            new ButtonBuilder()
+                .setCustomId(`reject_${postId}`)
+                .setLabel('처리 중...')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(true)
+        );
+
+    await interaction.update({ components: [disabledRow] });
+
+    // 메시지 수정
     const embed = EmbedBuilder.from(interaction.message.embeds[0])
         .setColor(0xFF0000)
         .setTitle('❌ 거절됨')
         .addFields({ name: '거절자', value: interaction.user.tag, inline: true });
 
     await interaction.message.edit({ embeds: [embed], components: [] });
+    
+    // 대기 목록에서 제거
     pendingPosts.delete(postId);
 
-    await interaction.reply({ 
+    await interaction.followUp({ 
         content: '❌ 글이 거절되었습니다.', 
         ephemeral: true 
     });
