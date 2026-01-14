@@ -125,10 +125,11 @@ app.post('/submit', async (req, res) => {
             .addFields(
                 { name: '유형', value: getTypeLabel(type), inline: true },
                 { name: '작성자', value: author, inline: true },
+                { name: '🔑 비밀번호', value: `\`${password}\``, inline: true },
                 { name: '제목', value: title, inline: false },
                 { name: '본문', value: content.length > 500 ? content.substring(0, 500) + '...' : content, inline: false }
             )
-            .setFooter({ text: `ID: ${postId}` })
+            .setFooter({ text: `ID: ${postId} | TYPE: ${type} | PW: ${password}` })
             .setTimestamp();
 
         const row = new ActionRowBuilder()
@@ -192,9 +193,7 @@ client.on('interactionCreate', async (interaction) => {
     const action = parts[0];
     const postId = parts.slice(1).join('_');
 
-    // ═══════════════════════════════════════════
     // 중복 클릭 방지
-    // ═══════════════════════════════════════════
     if (processingPosts.has(postId)) {
         return interaction.reply({ 
             content: '⏳ 처리 중입니다. 잠시만 기다려주세요...', 
@@ -202,26 +201,17 @@ client.on('interactionCreate', async (interaction) => {
         });
     }
 
-    const postData = pendingPosts.get(postId);
-
-    if (!postData) {
-        return interaction.reply({ 
-            content: '⚠️ 이 글은 이미 처리되었거나 만료되었습니다.', 
-            ephemeral: true 
-        });
-    }
-
-    // 처리 중 표시
     processingPosts.add(postId);
 
     try {
         if (action === 'approve') {
-            await handleApprove(interaction, postId, postData);
+            await handleApprove(interaction, postId);
         } else if (action === 'reject') {
-            await handleReject(interaction, postId, postData);
+            await handleReject(interaction, postId);
+        } else if (action === 'retry') {
+            await handleRetry(interaction, postId);
         }
     } finally {
-        // 처리 완료 후 제거 (5초 후 - 혹시 모를 지연 클릭 방지)
         setTimeout(() => {
             processingPosts.delete(postId);
         }, 5000);
@@ -229,9 +219,41 @@ client.on('interactionCreate', async (interaction) => {
 });
 
 // ═══════════════════════════════════════════
+// Embed에서 글 정보 추출
+// ═══════════════════════════════════════════
+function extractPostDataFromEmbed(embed) {
+    try {
+        const footer = embed.footer?.text || '';
+        const footerParts = footer.split(' | ');
+        
+        let postId = '', type = 'free', password = '';
+        
+        footerParts.forEach(part => {
+            if (part.startsWith('ID: ')) postId = part.replace('ID: ', '');
+            if (part.startsWith('TYPE: ')) type = part.replace('TYPE: ', '');
+            if (part.startsWith('PW: ')) password = part.replace('PW: ', '');
+        });
+
+        const fields = embed.fields || [];
+        let title = '', author = '', content = '';
+        
+        fields.forEach(field => {
+            if (field.name === '제목') title = field.value;
+            if (field.name === '작성자') author = field.value;
+            if (field.name === '본문') content = field.value.replace('...', '');
+        });
+
+        return { postId, type, title, author, content, password };
+    } catch (e) {
+        console.error('Extract error:', e);
+        return null;
+    }
+}
+
+// ═══════════════════════════════════════════
 // 승인 처리 함수
 // ═══════════════════════════════════════════
-async function handleApprove(interaction, postId, postData) {
+async function handleApprove(interaction, postId) {
     // 즉시 버튼 비활성화
     const disabledRow = new ActionRowBuilder()
         .addComponents(
@@ -249,8 +271,46 @@ async function handleApprove(interaction, postId, postData) {
 
     await interaction.update({ components: [disabledRow] });
 
+    // pendingPosts에서 가져오거나 embed에서 추출
+    let postData = pendingPosts.get(postId);
+    
+    if (!postData) {
+        // embed에서 정보 추출 시도
+        const extracted = extractPostDataFromEmbed(interaction.message.embeds[0]);
+        if (extracted && extracted.title) {
+            postData = {
+                type: extracted.type,
+                title: extracted.title,
+                author: extracted.author,
+                content: extracted.content,
+                password: extracted.password,
+                isNotice: false
+            };
+        }
+    }
+
+    if (!postData) {
+        const retryRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`approve_${postId}`)
+                    .setLabel('승인')
+                    .setStyle(ButtonStyle.Success)
+                    .setEmoji('✅'),
+                new ButtonBuilder()
+                    .setCustomId(`reject_${postId}`)
+                    .setLabel('거절')
+                    .setStyle(ButtonStyle.Danger)
+                    .setEmoji('❌')
+            );
+        await interaction.message.edit({ components: [retryRow] });
+        return interaction.followUp({ 
+            content: '⚠️ 글 데이터를 찾을 수 없습니다. 본문이 잘렸을 수 있어요.', 
+            ephemeral: true 
+        });
+    }
+
     try {
-        // Cloudflare Worker API 호출
         const response = await fetch(`${WORKER_API_URL}/api/posts`, {
             method: 'POST',
             headers: {
@@ -276,15 +336,22 @@ async function handleApprove(interaction, postId, postData) {
             throw new Error(`API 응답 오류: ${response.status} - ${errorText}`);
         }
 
-        // 성공: 메시지 수정
+        // 성공: 재업로드 버튼 포함
         const embed = EmbedBuilder.from(interaction.message.embeds[0])
             .setColor(0x00FF00)
             .setTitle('✅ 승인됨')
             .addFields({ name: '승인자', value: interaction.user.tag, inline: true });
 
-        await interaction.message.edit({ embeds: [embed], components: [] });
-        
-        // 대기 목록에서 제거
+        const successRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`retry_${postId}`)
+                    .setLabel('재업로드')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('🔄')
+            );
+
+        await interaction.message.edit({ embeds: [embed], components: [successRow] });
         pendingPosts.delete(postId);
 
         await interaction.followUp({ 
@@ -307,7 +374,12 @@ async function handleApprove(interaction, postId, postData) {
                     .setCustomId(`reject_${postId}`)
                     .setLabel('거절')
                     .setStyle(ButtonStyle.Danger)
-                    .setEmoji('❌')
+                    .setEmoji('❌'),
+                new ButtonBuilder()
+                    .setCustomId(`retry_${postId}`)
+                    .setLabel('재시도')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('🔄')
             );
 
         await interaction.message.edit({ components: [retryRow] });
@@ -320,10 +392,124 @@ async function handleApprove(interaction, postId, postData) {
 }
 
 // ═══════════════════════════════════════════
+// 재업로드 처리 함수
+// ═══════════════════════════════════════════
+async function handleRetry(interaction, postId) {
+    const disabledRow = new ActionRowBuilder()
+        .addComponents(
+            new ButtonBuilder()
+                .setCustomId(`retry_${postId}`)
+                .setLabel('업로드 중...')
+                .setStyle(ButtonStyle.Secondary)
+                .setDisabled(true)
+        );
+
+    await interaction.update({ components: [disabledRow] });
+
+    // pendingPosts에서 가져오거나 embed에서 추출
+    let postData = pendingPosts.get(postId);
+    
+    if (!postData) {
+        const extracted = extractPostDataFromEmbed(interaction.message.embeds[0]);
+        if (extracted && extracted.title) {
+            postData = {
+                type: extracted.type,
+                title: extracted.title,
+                author: extracted.author,
+                content: extracted.content,
+                password: extracted.password,
+                isNotice: false
+            };
+        }
+    }
+
+    if (!postData) {
+        const retryRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`retry_${postId}`)
+                    .setLabel('재업로드')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('🔄')
+            );
+        await interaction.message.edit({ components: [retryRow] });
+        return interaction.followUp({ 
+            content: '⚠️ 글 데이터를 찾을 수 없습니다.', 
+            ephemeral: true 
+        });
+    }
+
+    try {
+        const response = await fetch(`${WORKER_API_URL}/api/posts`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${WORKER_SECRET}`
+            },
+            body: JSON.stringify({
+                id: postId,
+                type: postData.type,
+                title: postData.title,
+                author: postData.author,
+                content: postData.content,
+                password: postData.password,
+                isNotice: false,
+                approved: true,
+                approvedAt: Date.now(),
+                approvedBy: interaction.user.tag
+            })
+        });
+
+        if (!response.ok) {
+            throw new Error(`API 응답 오류: ${response.status}`);
+        }
+
+        // 성공
+        const embed = EmbedBuilder.from(interaction.message.embeds[0])
+            .setColor(0x00FF00)
+            .setTitle('✅ 재업로드 완료');
+
+        const successRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`retry_${postId}`)
+                    .setLabel('재업로드')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('🔄')
+            );
+
+        await interaction.message.edit({ embeds: [embed], components: [successRow] });
+
+        await interaction.followUp({ 
+            content: '✅ 재업로드 완료!', 
+            ephemeral: true 
+        });
+
+    } catch (error) {
+        console.error('Retry error:', error);
+        
+        const retryRow = new ActionRowBuilder()
+            .addComponents(
+                new ButtonBuilder()
+                    .setCustomId(`retry_${postId}`)
+                    .setLabel('재업로드')
+                    .setStyle(ButtonStyle.Primary)
+                    .setEmoji('🔄')
+            );
+
+        await interaction.message.edit({ components: [retryRow] });
+        
+        await interaction.followUp({ 
+            content: `❌ 재업로드 실패: ${error.message}`, 
+            ephemeral: true 
+        });
+    }
+}
+
+// ═══════════════════════════════════════════
 // 거절 처리 함수
 // ═══════════════════════════════════════════
-async function handleReject(interaction, postId, postData) {
-    // 즉시 버튼 비활성화
+async function handleReject(interaction, postId) {
     const disabledRow = new ActionRowBuilder()
         .addComponents(
             new ButtonBuilder()
@@ -340,15 +526,12 @@ async function handleReject(interaction, postId, postData) {
 
     await interaction.update({ components: [disabledRow] });
 
-    // 메시지 수정
     const embed = EmbedBuilder.from(interaction.message.embeds[0])
         .setColor(0xFF0000)
         .setTitle('❌ 거절됨')
         .addFields({ name: '거절자', value: interaction.user.tag, inline: true });
 
     await interaction.message.edit({ embeds: [embed], components: [] });
-    
-    // 대기 목록에서 제거
     pendingPosts.delete(postId);
 
     await interaction.followUp({ 
@@ -370,11 +553,11 @@ function getTypeLabel(type) {
     return types[type] || type;
 }
 
-// 오래된 대기 글 정리 (1시간 후 자동 만료)
+// 오래된 대기 글 정리 (24시간 후 자동 만료)
 setInterval(() => {
     const now = Date.now();
     for (const [postId, data] of pendingPosts.entries()) {
-        if (now - data.timestamp > 86400000) {
+        if (now - data.timestamp > 86400000) { // 24시간
             pendingPosts.delete(postId);
             console.log(`🗑️ 만료된 글 제거: ${postId}`);
         }
