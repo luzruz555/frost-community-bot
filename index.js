@@ -160,25 +160,54 @@ client.once('ready', () => {
     console.log(`[DISCORD] 로그인: ${client.user.tag}`);
 });
 
+// 에러 핸들링
+client.on('error', (error) => {
+    console.error('[DISCORD] 에러:', error.message);
+});
+
+process.on('unhandledRejection', (error) => {
+    console.error('[PROCESS] 처리되지 않은 에러:', error.message);
+});
+
+// 처리 중인 interaction 추적
+const processingInteractions = new Set();
+
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isButton()) return;
+
+    // 중복 처리 방지
+    if (processingInteractions.has(interaction.id)) {
+        return;
+    }
+    processingInteractions.add(interaction.id);
 
     const [action, ...idParts] = interaction.customId.split('_');
     const postId = idParts.join('_');
     
     console.log(`[BUTTON] ${action} - ${postId}`);
 
-    if (action === 'approve') {
-        await handleApprove(interaction, postId);
-    } else if (action === 'reject') {
-        await handleReject(interaction, postId);
-    } else if (action === 'retry') {
-        await handleRetry(interaction, postId);
+    try {
+        if (action === 'approve') {
+            await handleApprove(interaction, postId);
+        } else if (action === 'reject') {
+            await handleReject(interaction, postId);
+        } else if (action === 'retry') {
+            await handleRetry(interaction, postId);
+        }
+    } catch (error) {
+        console.error('[BUTTON] 에러:', error.message);
+    } finally {
+        processingInteractions.delete(interaction.id);
     }
 });
 
 async function handleApprove(interaction, postId) {
-    await interaction.deferUpdate();
+    try {
+        await interaction.deferUpdate();
+    } catch (e) {
+        console.log('[APPROVE] deferUpdate 실패 (이미 응답됨)');
+        return;
+    }
     
     const postData = pendingPosts.get(postId);
     
@@ -203,8 +232,11 @@ async function handleApprove(interaction, postId) {
                     .setLabel('재시도')
                     .setStyle(ButtonStyle.Primary)
             );
-        await interaction.editReply({ components: [retryRow] });
-        return interaction.followUp({ content: '❌ 글 데이터를 찾을 수 없습니다.', ephemeral: true });
+        try {
+            await interaction.editReply({ components: [retryRow] });
+            await interaction.followUp({ content: '❌ 글 데이터를 찾을 수 없습니다.', ephemeral: true });
+        } catch (e) {}
+        return;
     }
 
     const result = await savePost(postId, data);
@@ -227,8 +259,10 @@ async function handleApprove(interaction, postId) {
                     .setStyle(ButtonStyle.Secondary)
             );
         
-        await interaction.editReply({ embeds: [successEmbed], components: [retryRow] });
-        await interaction.followUp({ content: '✅ 글이 승인되어 게시되었습니다!', ephemeral: true });
+        try {
+            await interaction.editReply({ embeds: [successEmbed], components: [retryRow] });
+            await interaction.followUp({ content: '✅ 글이 승인되어 게시되었습니다!', ephemeral: true });
+        } catch (e) {}
     } else {
         const retryRow = new ActionRowBuilder()
             .addComponents(
@@ -245,13 +279,20 @@ async function handleApprove(interaction, postId) {
                     .setLabel('재시도')
                     .setStyle(ButtonStyle.Primary)
             );
-        await interaction.editReply({ components: [retryRow] });
-        await interaction.followUp({ content: `❌ 저장 실패: ${result.error}`, ephemeral: true });
+        try {
+            await interaction.editReply({ components: [retryRow] });
+            await interaction.followUp({ content: `❌ 저장 실패: ${result.error}`, ephemeral: true });
+        } catch (e) {}
     }
 }
 
 async function handleReject(interaction, postId) {
-    await interaction.deferUpdate();
+    try {
+        await interaction.deferUpdate();
+    } catch (e) {
+        console.log('[REJECT] deferUpdate 실패 (이미 응답됨)');
+        return;
+    }
     
     const postData = pendingPosts.get(postId);
     const title = postData?.title || '제목 없음';
@@ -265,12 +306,19 @@ async function handleReject(interaction, postId) {
         .setColor(0xFF0000)
         .setTitle('❌ 거절됨');
     
-    await interaction.editReply({ embeds: [rejectEmbed], components: [] });
-    await interaction.followUp({ content: '❌ 글이 거절되었습니다.', ephemeral: true });
+    try {
+        await interaction.editReply({ embeds: [rejectEmbed], components: [] });
+        await interaction.followUp({ content: '❌ 글이 거절되었습니다.', ephemeral: true });
+    } catch (e) {}
 }
 
 async function handleRetry(interaction, postId) {
-    await interaction.deferUpdate();
+    try {
+        await interaction.deferUpdate();
+    } catch (e) {
+        console.log('[RETRY] deferUpdate 실패 (이미 응답됨)');
+        return;
+    }
     
     let postData = pendingPosts.get(postId);
     
@@ -285,7 +333,10 @@ async function handleRetry(interaction, postId) {
     }
     
     if (!postData) {
-        return interaction.followUp({ content: '❌ 글 데이터를 복구할 수 없습니다.', ephemeral: true });
+        try {
+            await interaction.followUp({ content: '❌ 글 데이터를 복구할 수 없습니다.', ephemeral: true });
+        } catch (e) {}
+        return;
     }
     
     const result = await savePost(postId, postData);
@@ -295,10 +346,14 @@ async function handleRetry(interaction, postId) {
             .setColor(0x00FF00)
             .setTitle('✅ 재업로드 완료');
         
-        await interaction.editReply({ embeds: [successEmbed] });
-        await interaction.followUp({ content: '✅ 재업로드 완료!', ephemeral: true });
+        try {
+            await interaction.editReply({ embeds: [successEmbed] });
+            await interaction.followUp({ content: '✅ 재업로드 완료!', ephemeral: true });
+        } catch (e) {}
     } else {
-        await interaction.followUp({ content: `❌ 재업로드 실패: ${result.error}`, ephemeral: true });
+        try {
+            await interaction.followUp({ content: `❌ 재업로드 실패: ${result.error}`, ephemeral: true });
+        } catch (e) {}
     }
 }
 
