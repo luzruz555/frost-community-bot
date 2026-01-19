@@ -212,6 +212,9 @@ async function handleApprove(interaction, postId) {
     if (result.success) {
         pendingPosts.delete(postId);
         
+        // 관리 로그 추가
+        await addAdminLog('approve', postId, data.title);
+        
         const successEmbed = EmbedBuilder.from(interaction.message.embeds[0])
             .setColor(0x00FF00)
             .setTitle('✅ 승인 완료');
@@ -250,7 +253,13 @@ async function handleApprove(interaction, postId) {
 async function handleReject(interaction, postId) {
     await interaction.deferUpdate();
     
+    const postData = pendingPosts.get(postId);
+    const title = postData?.title || '제목 없음';
+    
     pendingPosts.delete(postId);
+    
+    // 관리 로그 추가
+    await addAdminLog('reject', postId, title);
     
     const rejectEmbed = EmbedBuilder.from(interaction.message.embeds[0])
         .setColor(0xFF0000)
@@ -322,6 +331,28 @@ function restoreFromEmbed(embed, postId) {
 function getTypeLabel(type) {
     const labels = { free: '자유', info: '정보', trade: '거래', help: '질문' };
     return labels[type] || type;
+}
+
+// 관리 로그 추가
+async function addAdminLog(action, postId, postTitle) {
+    try {
+        await fetch(`${WORKER_API_URL}/api/admin/logs`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Admin-Key': 'luzruz555'
+            },
+            body: JSON.stringify({
+                action,
+                postId,
+                postTitle,
+                adminName: '겁많은두더지'
+            })
+        });
+        console.log(`[LOG] ${action}: ${postTitle}`);
+    } catch (e) {
+        console.error('[LOG] 로그 추가 실패:', e.message);
+    }
 }
 
 // ============ 시작 ============
